@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2016
+set -e
+
+((BASH_VERSINFO[0] < 4)) && echo "Bash 4+ required." && exit 1
+
+: "${PAGER:=more}"
+: "${EDITOR:=vi}"
+: "${HELP_BROWSER:=}"
+: "${YOUTUBE_CHANID:=}"
+
+APIKEY=$(auth get id youtubeapikey)
+TOKEN=$(auth token youtube)
+
+EXE="${0##*/}"
+
+declare -A help # associative arrays *require* declaration
+
+help[main]='
+# YouTube Command Line Utility
+
+The `yt` utility is a bash script that uses `curl` to do the most common
+tasks involving [YouTube API] related to video management and live
+streaming. This includes retrieving or setting video title, description,
+and upload information. If you are just starting out with the YouTube API and bash scripting, this script provides a good starting point for
+understanding how the YouTube API works.
+
+[YouTube API]: <https://developers.google.com/youtube/v3/getting-started>
+
+## Usage
+
+```
+yt (description|help|last|live|open|title|uploads|usage|video)
+```
+
+## Dependencies
+
+* `bash` (4+)
+* `curl`
+* `jq`
+* `tput`
+* `$EDITOR`
+* `$PAGER`
+* `pandoc`
+* <https://github.com/rwxrob/auth-go> (but easily replaced)
+
+## Legal
+
+Copyright 2021 Rob Muhlestein <rob@rwx.gg>  
+Released under Apache-2.0 license  
+Please mention https://youtube.com/rwxrob'
+
+# ----------------------------- commands -----------------------------
+
+help[live]='
+```
+yt live [(id|url|title)]
+```
+
+Outputs the current live stream video.  By default, returns a YouTube
+URL. To get only the YouTube identifier add `id`. To get the title add
+`title`. To set the title provide it after `title`.'
+
+command_live() {
+	case $1 in
+	id)
+		command__live_id
+		return $?
+		;;
+	title)
+		shift
+		command__live_title "$@"
+		return $?
+		;;
+	url | *) echo "https://youtu.be/$(command__live_id)" ;;
+	esac
+}
+
+command__live_id() {
+	curl -s \
+		"https://www.googleapis.com/youtube/v3/liveBroadcasts?part=id&broadcastStatus=active&key=${APIKEY}" \
+		-H "Authorization: Bearer ${TOKEN}" \
+		-H "Accept: application/json" \
+		--compressed |
+		jq -r '.items[0].id'
+}
+
+command__live_title() {
+	local id=$(command__live_id)
+	command_title "$id" "$@"
+}
+
+help[uploads]='
+```
+yt uploads [<count>]
+```
+
+Lists the most recently uploaded videos (from the uploads playlist) by
+YouTube identifier and current title. By default, only displays enough
+lines to fill the current terminal screen. (Keep in mind, this only
+works if title length has been kept to 74 or fewer columns.) Provide
+a `<count>` argument with the total number if more lines are are wanted.
+
+Note that a live stream video is always included in the `uploads` YouTube playlist and therefore will need to be explicitely excluded.
+'
+
+command_uploads() {
+	local lines=10 pl
+	if [[ -t 1 ]]; then
+		lines=$(($(tput lines) - 2))
+	fi
+	[[ -n "$1" ]] && lines="$1"
+	local pl=$(curl -s \
+		"https://www.googleapis.com/youtube/v3/channels?part=contentDetails&key=${APIKEY}&mine=true" \
+		-H "Authorization: Bearer ${TOKEN}" \
+		-H "Accept: application/json" \
+		--compressed |
+		jq -r '.items[0].contentDetails.relatedPlaylists.uploads')
+	curl -s \
+		"https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&key=${APIKEY}&playlistId=$pl&maxResults=$lines" \
+		-H "Authorization: Bearer ${TOKEN}" \
+		-H "Accept: application/json" \
+		--compressed |
+		jq -r '.items[].snippet | .resourceId.videoId + " " + .title'
+	#jq -r '.items[].snippet | .publishedAt + " " + .resourceId.videoId + " " + .title'
+}
+
+help[video]='
+```
+yt video (last|live|<id>|<url>) | jq ...
+file=$(yt video last | jq .fileDetails.fileName)
+likes=$(yt video last | jq .statistics.likeCount)
+```
+
+Outputs the JSON returned for the given video (by ID or URL) suitable
+for passing to `jq` for further isolation. This includes the following:
+
+* `.id`
+* `.fileDetails`
+* `.contentDetails`
+* `.statistics`
+* `.status`
+* `.liveStreamingDetails`
+* `.player`
+* `.processingDetails`
+* `.recordingDetails`
+* `.suggestions`
+* `.topicDetails`
+* `.localizations`
+
+If and when queries are needed that span multiple videos and do not need all of this consider adding a new command specifically for those cases since this specific command is so heavy.'
+
+command_video() {
+	local id="$1"
+	[[ $id == last ]] && id=$(command_last)
+	[[ $id == live ]] && id=$(command__live_id)
+	id="${id##*/}"
+	curl -s \
+		"https://www.googleapis.com/youtube/v3/videos?part=snippet,fileDetails,contentDetails,statistics,status,id,liveStreamingDetails,player,processingDetails,recordingDetails,suggestions,topicDetails,localizations&key=${APIKEY}&id=$id" \
+		-H "Authorization: Bearer ${TOKEN}" \
+		-H "Accept: application/json" \
+		--compressed | jq -r '.items[0]'
+}
+
+help[description]='
+```
+yt description (last|live|<id>|<url>) [<string>]
+```
+
+The `description` command outputs the description text from the
+specified video (as rendered by `jq`).  If an additional `<string>`
+argument is passed the description will be set instead. '
+
+command_description() {
+	local id="$1"
+	[[ $id == last ]] && id=$(command_last)
+	[[ $id == live ]] && id=$(command__live_id)
+	id="${id##*/}"
+	if [[ $# > 1 ]]; then
+		command__set_desc "$@"
+		return $?
+	fi
+	curl -s \
+		"https://www.googleapis.com/youtube/v3/videos?part=snippet&key=${APIKEY}&id=$id" \
+		-H "Authorization: Bearer ${TOKEN}" \
+		-H "Accept: application/json" \
+		--compressed |
+		jq -r '.items[0].snippet.description'
+}
+
+command__set_desc() {
+	local id="$1"
+	[[ $id == last ]] && id=$(command_last)
+	[[ $id == live ]] && id=$(command__live_id)
+	id="${id##*/}"
+	shift
+	local title=$(command_title "$id")
+	local desc="$*"
+	local eol=$'\n'
+	desc=${desc//$eol/\\n}
+	curl -s --compressed -X PUT \
+		"https://www.googleapis.com/youtube/v3/videos?part=snippet&key=${APIKEY}" \
+		-H "Authorization: Bearer ${TOKEN}" \
+		-H "Accept: application/json" \
+		-H "Content-Type: application/json" \
+		--data-raw '{"id": "'"$id"'", "snippet": {"title": "'"$title"'","categoryId":"28", "description": "'"$desc"'"} }' | jq -r '.snippet.description'
+}
+
+help[last]='
+```
+yt last [id|url]
+```
+
+Outputs the most recently added file to the YouTube internal `uploads`
+playlist (see `yt uploads` as well). If `id` is added will only output
+the ID portion. Otherwise, `url` is the default.'
+
+command_last() {
+	local l=$(command_uploads | head -1)
+	if [[ $1 = id ]]; then
+		echo "${l%% *}"
+		return 0
+	fi
+	echo "https://youtu.be/${l%% *}"
+}
+
+help[open]='
+```
+yt open [last|live|<id>|<url>]
+```
+
+Detects an external `open` command, function, or alias and calls it
+passing in the YouTube URL to the specific video.  Outputs `<open
+command not found>` if cannot find. If no video is passed, opens up the
+youtube.com web page.'
+
+command_open() {
+	! _have open && echo '<open command not detected>' && return 0
+	local what="${1##*/}"
+	case $what in
+	last) open "$(command_last)" ;;
+	live) open "$(command_live)" ;;
+	*) open "https://youtu.be/$what" ;;
+	esac
+}
+
+help[title]='
+```
+yt title (last|live|<id>|<url>) [<string>]
+```
+
+Outputs title for the specified video or sets it to a new one passed as
+`<string>`.'
+
+command_title() {
+	local id="$1"
+	[[ $id == last ]] && id=$(command_last)
+	[[ $id == live ]] && id=$(command__live_id)
+	id="${id##*/}"
+	if [[ $# > 1 ]]; then
+		command__set_title "$@"
+		return $?
+	fi
+	curl -s \
+		"https://www.googleapis.com/youtube/v3/videos?part=snippet&key=${APIKEY}&id=$id" \
+		-H "Authorization: Bearer ${TOKEN}" \
+		-H "Accept: application/json" \
+		--compressed |
+		jq -r '.items[0].snippet.title'
+}
+
+command__set_title() {
+	local id="$1"
+	[[ $id == last ]] && id=$(command_last)
+	[[ $id == live ]] && id=$(command__live_id)
+	id="${id##*/}"
+	shift
+	curl -s --compressed -X PUT \
+		"https://www.googleapis.com/youtube/v3/videos?part=snippet&key=${APIKEY}" \
+		-H "Authorization: Bearer ${TOKEN}" \
+		-H "Accept: application/json" \
+		-H "Content-Type: application/json" \
+		--data-raw '{"id": "'"$id"'", "snippet": {"title": "'"$*"'", "categoryId":"28"} }' | jq -r '.snippet.title'
+}
+
+help[publish]='
+```
+yt publish (last|live|<id>|<url>) <title> <description> [<category>]
+```
+
+Publishes an uploaded video that has not yet been published using the
+least amount of YouTube API quote points possible. Updates if already
+published. The `<title>` and `<description>` are required. If
+`<category>` is omitted the value 28 (Science and Technology) will be
+used as the default.
+
+Note about monetization: Unfortunately, monetization through the API
+requires special privileges. Monetization can be activated in bulk by
+selecting multiple videos from the YouTube studio web page.'
+
+command_publish() {
+	local id="$1" title="$2" desc="$3" categ="${4:-28}"
+	[[ $id == last ]] && id=$(command_last)
+	[[ $id == live ]] && id=$(command__live_id)
+	id="${id##*/}"
+	[[ ! -n "$title" ]] && echo '<publish requires title>' && return 1
+	[[ ! -n "$desc" ]] && echo '<publish requires description>' && return 1
+	[[ ! -n "$categ" ]] && echo '<publish requires category>' && return 1
+	title=$(_jsonstr "$title")
+	desc=$(_jsonstr "$desc")
+	local resp=$(curl -s --compressed -X PUT \
+		"https://www.googleapis.com/youtube/v3/videos?part=snippet,status&key=${APIKEY}" \
+		-H "Authorization: Bearer ${TOKEN}" \
+		-H "Accept: application/json" \
+		-H "Content-Type: application/json" \
+		--data-raw '{"id": "'"$id"'", "status":{"privacyStatus":"public"},"snippet": {"title": '"$title"',"categoryId":"'"$categ"'", "description": '"$desc"'} }')
+	local err=$(jq -r '.error.errors[0].message' <<<"$resp")
+	[[ $err = null ]] || (echo "$err" && return 1)
+}
+
+# ------------------ builtin commands and functions ------------------
+#           (https://github.com/rwxrob/template-bash-command)
+
+help[usage]='Displays a summary of usage.'
+
+command_usage() {
+	local -a cmds
+	for c in "${COMMANDS[@]}"; do
+		[[ ${c:0:1} =~ _ ]] && continue
+		cmds+=($c)
+	done
+	cmds="${cmds[*]}"
+	printf "usage: %s (%s)\n" "$EXE" "${cmds// /|}"
+}
+
+help[help]='
+# Display Help Information
+
+```
+help [<command>]
+```
+
+Displays specific help information. If no argument is passed displays
+general help information (main). Otherwise, the documentation for the
+specific argument keyword is displayed, which usually corresponds to
+a command name (but not necessarily). All documentation is written in
+GitHub Flavored Markdown and will displayed as a web page if `pandoc`
+and `$HELP_BROWSER` are detected, otherwise, just the Markdown is sent
+to `$PAGER` (default: more).
+
+Also see `readme` and `usage` commands.
+'
+
+command_help() {
+	local name="${1:-main}" title own body
+	title=$(_help_title "$name") || true
+	if [[ -z "$title" ]]; then
+		body="${help[$name]}"
+		title="$EXE $name"
+		[[ $name = main ]] && title="$EXE"
+	else
+		body="${help[$name]}"
+		body=${body#*$title}
+	fi
+	local file="/tmp/help-$EXE-$name.html"
+	if _have pandoc; then
+		if _have "$HELP_BROWSER" && [[ -t 1 ]]; then
+			pandoc -s --metadata title="$title" \
+				-o "$file" <<<"$body"
+			[[ -z "$2" ]] && cd /tmp && exec "$HELP_BROWSER" "$file"
+			return 0
+		fi
+		pandoc -s --metadata title="$title" \
+			-t plain <<<"$body" | "$PAGER"
+		return 0
+	fi
+	echo -e "$title\n\n$body" | "$PAGER"
+}
+
+help[readme]='
+# Generate `README.md` File
+
+```
+command readme > README.md
+```
+
+The `readme` command will output the embedded help documentation in raw
+GitHub Flavored Markdown suitable for use as a `README.md` file on
+GitHub or similar hosting service.  '
+
+command_readme() {
+	_trim "${help[main]}"
+	local usage="$(command_usage)"
+	printf "\n## Commands\n\n"
+	local -a names=("${!help[@]}")
+	while IFS= read -r name; do
+		[[ $name = main ]] && continue
+		local body=$(_trim "${help[$name]}")
+		[[ $body =~ ^\# ]] || body="# The \`$name\` Command\n\n$body"
+		printf "##$body\n\n"
+	done < <(printf "%s\n" "${!help[@]}" | LC_COLLATE=C sort)
+	echo -e "----\n\n*Autogenerated $(date)*\n"
+}
+
+_help_title() {
+	_filter "$@" && return $?
+	local name="$1"
+	while IFS= read -r line; do
+		[[ $line =~ ^[:space]*$ ]] && continue
+		[[ $line =~ ^#\ (.+) ]] && echo "${BASH_REMATCH[1]}" && return 0
+		return 1
+	done <<<"${help[$name]}"
+}
+
+_trim() {
+	local it="${1#"${1%%[![:space:]]*}"}"
+	echo -e "${it%"${it##*[![:space:]]}"}"
+}
+
+_have() { type "$1" &>/dev/null; }
+
+_jsonstr() {
+	_buffer "$@" && return $?
+	jq -MRsc <<<"$1"
+}
+
+_filter() {
+	[[ -n "$1" ]] && return 1
+	while IFS= read -ra args; do
+		"${FUNCNAME[1]}" "${args[@]}"
+	done
+}
+
+_buffer() {
+	[[ -n "$1" ]] && return 1
+	"${FUNCNAME[1]}" "$(</dev/stdin)"
+}
+
+# --------------------- completion and delegation --------------------
+#         (better than . <(foo bloated_completion) in .bashrc)
+
+while IFS= read -r line; do
+	[[ $line =~ ^declare\ -f\ command_ ]] || continue
+	COMMANDS+=("${line##declare -f command_}")
+done < <(declare -F)
+COMMANDS=($(LC_COLLATE=C sort < <(printf "%s\n" "${COMMANDS[@]}")))
+
+if [[ -n $COMP_LINE ]]; then
+	line=${COMP_LINE#* }
+	for c in "${COMMANDS[@]}"; do
+		[[ ${c:0:${#line}} == "${line,,}" && ${c:0:1} != _ ]] && echo "$c"
+	done
+	exit
+fi
+
+for c in "${COMMANDS[@]}"; do
+	if [[ $c == "$EXE" ]]; then
+		"command_$EXE" "$@"
+		exit $?
+	fi
+done
+
+if [[ -n "$1" ]]; then
+	declare cmd="$1"
+	shift
+	for c in "${COMMANDS[@]}"; do
+		if [[ $c == "$cmd" ]]; then
+			"command_$cmd" "$@"
+			exit $?
+		fi
+	done
+fi
+
+command_usage "$@"

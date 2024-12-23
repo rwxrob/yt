@@ -1,0 +1,9 @@
+go 1.23.4
+
+use (
+	.
+	../bonzai
+	../bonzai/cmds/help
+	../bonzai/mark
+	../bonzai/persisters/inprops
+)
